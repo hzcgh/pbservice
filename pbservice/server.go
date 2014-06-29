@@ -10,6 +10,7 @@ import "sync"
 import "os"
 import "syscall"
 import "math/rand"
+import "errors"
 
 type PBServer struct {
 	mu         sync.Mutex
@@ -26,6 +27,7 @@ type PBServer struct {
 	kv         map[string]string
 
 	oldBackup string
+	delta map[string]string
 }
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
@@ -33,6 +35,10 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
+
+	if !pb.am_primary {
+		return errors.New("Only primary server can accept Get()")
+	}
 
 	reply.Value = pb.kv[args.Key]
 
@@ -42,21 +48,43 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 func (pb *PBServer) Put(args *PutArgs, reply *PutReply) error {
 	reply.Err = OK
 
-	fmt.Printf("Put - Me: %v, am_primary: %v, am_backup: %v, args: %v\n",pb.me,pb.am_primary, pb.am_backup, args)
-
 	// Your code here.
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
+	if !pb.am_primary {
+		return errors.New("Only primary server can accept Put()")
+	}
+
 	pb.kv[args.Key] = args.Value
 
 	// Forward Put to the backup server
-	if pb.am_primary {
-		call(pb.view.Backup, "PBServer.Put", args, &reply)
+	if pb.am_primary && pb.view.Backup != "" {
+		ok := call(pb.view.Backup, "PBServer.Forward", args, &reply)
+
+		if !ok {
+			pb.delta[args.Key] = args.Value
+		}
+
 	}
 
 	return nil
 }
+
+func (pb *PBServer) Forward(args *PutArgs, reply *PutReply) error {
+	reply.Err = OK
+	
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	
+	// Only accept the forward if this is a backup server
+	if pb.am_backup {
+		pb.kv[args.Key] = args.Value
+	}
+	
+	return nil	
+}
+
 
 func (pb *PBServer) Init(args *InitArgs, reply *InitReply) error {
 	pb.mu.Lock()
@@ -64,11 +92,12 @@ func (pb *PBServer) Init(args *InitArgs, reply *InitReply) error {
 
 	reply.Err = OK
 
-	pb.kv = args.Kv
+	for k, v := range args.Kv {
+		pb.kv[k] = v
+	}
 
 	return nil
 }
-
 
 //
 // ping the viewserver periodically.
@@ -82,13 +111,8 @@ func (pb *PBServer) tick() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	//fmt.Printf("%+v\n", pb)
-	
-	fmt.Printf("Me: %v, kv: %v\n",pb.me,pb.kv)
-
 	v, _ := pb.vs.Ping(pb.view.Viewnum)
 
-	//	fmt.Printf("%+v\n", v)
 	pb.view = v
 
 	// For primary server
@@ -99,9 +123,23 @@ func (pb *PBServer) tick() {
 			if v.Backup != "" {
 				// the backup server has changed, so the primary server should forward the whole database
 				args := &InitArgs{Kv: pb.kv}
-				call(pb.view.Backup, "PBServer.Init", args, &InitReply{})				
+
+				ok := call(pb.view.Backup, "PBServer.Init", args, &InitReply{})
+				if ok {
+					pb.oldBackup = v.Backup
+
+				}
+
 			}
-			pb.oldBackup = v.Backup
+		} else if len(pb.delta) != 0 {
+			args := &InitArgs{Kv: pb.delta}
+			
+			ok := call(pb.view.Backup, "PBServer.Init", args, &InitReply{})
+
+			if ok {
+				pb.delta = make(map[string]string)
+			}
+
 		}
 
 	} else {
@@ -133,6 +171,7 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.am_backup = false
 	pb.am_primary = false
 	pb.kv = make(map[string]string)
+	pb.delta = make(map[string]string)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
@@ -153,11 +192,9 @@ func StartServer(vshost string, me string) *PBServer {
 			if err == nil && pb.dead == false {
 				if pb.unreliable && (rand.Int63()%1000) < 100 {
 					// discard the request.
-					fmt.Println("Unreliable - discard the request")
 					conn.Close()
 				} else if pb.unreliable && (rand.Int63()%1000) < 200 {
 					// process the request but force discard of reply.
-					fmt.Println("Unreliable - process the request but force discard of reply")
 					c1 := conn.(*net.UnixConn)
 					f, _ := c1.File()
 					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
